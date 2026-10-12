@@ -1,0 +1,23 @@
+GCC Lite v1.0.0 — 229 KB Win32 rewrite of the Lecoo Bellator N176 console
+
+Reverse-engineered replacement for the vendor's 433 MB .NET/WPF console
+(斗战者控制台), reducing it to a single 229 KB native executable with zero
+third-party dependencies.
+
+Hardware access
+- Recovered the ACPI-WMI protocol from the vendor binary:
+  root\WMI : MICommonInterface, instance ACPI\PNP0C14\MIFS_0, method MiInterface
+- 32-byte request buffer: buf[1]=Get(250)/Set(251), buf[3]=method, buf[4]=value
+- No kernel driver, no EC access, no undocumented IOCTLs
+
+Features
+- Four performance modes (Balance/Performance/Quiet/Fullspeed), verified read+write
+- Manual fan speed control (new)
+- Time-range scheduling: HH:MM-HH:MM -> mode, up to 6 rules, cross-midnight aware (new)
+- CPU/GPU/memory utilization, CPU frequency and temperature
+- CPU power draw via AMD RAPL hardware counters (12-17 W typical)
+- Fan RPM (CPU/GPU), battery voltage/capacity/cycle count/power
+
+Monitoring uses Windows built-in PDH counters instead of LibreHardwareMonitor.
+
+Includes 29 scheduler unit tests and documented reverse-engineering tooling.

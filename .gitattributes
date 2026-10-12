@@ -1,0 +1,20 @@
+# Normalize line endings
+* text=auto
+
+# Source / docs: LF in repo
+*.cpp  text eol=lf
+*.h    text eol=lf
+*.cs   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+
+# Windows batch files must keep CRLF
+*.bat  text eol=crlf
+
+# Binaries
+*.exe  binary
+*.dll  binary
+*.obj  binary
+*.pdb  binary
+*.png  binary

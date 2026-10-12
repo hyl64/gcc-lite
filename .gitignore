@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+
+# Vendored RE tooling (large, not project code)
+ghidra_*/
+ghidra*.zip
+
+# IDE
+.vs/
+.vscode/
+*.user
+*.suo
+
+# OS
+Thumbs.db
+desktop.ini
+
+# Scratch output from diagnostic runs
+*_out.txt
+*_result*.txt
+controls_dump.txt
+final_*.txt
+*.log
