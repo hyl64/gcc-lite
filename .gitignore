@@ -27,3 +27,6 @@ desktop.ini
 controls_dump.txt
 final_*.txt
 *.log
+
+# commit message scratch
+.commitmsg
