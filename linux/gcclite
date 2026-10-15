@@ -1,0 +1,666 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+gcclite — Lecoo Bellator N176 (斗战者 N176) 性能模式控制 · Linux 版
+====================================================================
+
+gcc-lite (Windows) 的 Ubuntu 移植命令行前端。
+硬件控制由 bitland-mifs-wmi 内核驱动完成（linux/driver/），
+本工具只负责读写它暴露的 sysfs / hwmon 接口。
+
+四种性能模式（与原厂「斗战者控制台」一致）：
+
+    gcclite mode quiet        静音模式   → platform_profile: low-power
+    gcclite mode balanced     均衡模式   → platform_profile: balanced
+    gcclite mode performance  性能模式   → platform_profile: balanced-performance
+    gcclite mode fullspeed    狂暴模式   → platform_profile: performance
+
+中文别名同样可用：gcclite mode 静音 / 均衡 / 性能 / 狂暴。
+
+仅依赖 Python 3 标准库。
+"""
+
+import argparse
+import errno
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# 常量与模式表
+# ---------------------------------------------------------------------------
+
+# 内核里模块名与驱动名不同：模块是 bitland_mifs_wmi（/sys/module、
+# /proc/modules），注册到 wmi 总线上的驱动名是 bitland-mifs-wmi
+# （/sys/bus/wmi/drivers/bitland-mifs-wmi/），注意下划线/连字符。
+MODULE_NAME = "bitland_mifs_wmi"
+DRIVER_NAME = "bitland-mifs-wmi"
+WMI_CONTROL_GUID = "B60BFB48-3E5B-49E4-A0E9-8CFFE1B3434B"
+
+# 测试钩子：把 GCCLITE_SYSROOT 指向一份伪造的 sysfs 树即可离线跑全部读路径
+SYSROOT = os.environ.get("GCCLITE_SYSROOT", "/sys")
+
+# platform_profile 传统接口（类接口位于 $SYSROOT/class/platform_profile/…）
+PP_LEGACY = os.path.join(SYSROOT, "firmware/acpi/platform_profile")
+
+PRIV_HELPER = "/usr/local/libexec/gcclite-write"
+MOK_DER = "/var/lib/shim-signed/mok/MOK.der"
+
+# 供电类型（WMI 方法 19 SystemAcType）
+AC_TYPES = {1: "Type-C", 2: "圆孔电源适配器 (DC)"}
+
+# user-facing 名称 → platform_profile 名称
+# 顺序即「狂暴 → 静音」的功耗从高到低排列
+MODES = {
+    "quiet":       ("low-power",            "静音模式"),
+    "balanced":    ("balanced",             "均衡模式"),
+    "performance": ("balanced-performance", "性能模式"),
+    "fullspeed":   ("performance",          "狂暴模式 (全速)"),
+}
+MODE_ALIASES = {
+    "静音": "quiet", "安静": "quiet", "silent": "quiet",
+    "均衡": "balanced", "平衡": "balanced", "balance": "balanced",
+    "性能": "performance", "perf": "performance",
+    "狂暴": "fullspeed", "全速": "fullspeed", "野兽": "fullspeed",
+    "beast": "fullspeed", "full-speed": "fullspeed", "turbo": "fullspeed",
+    "游戏": "fullspeed", "game": "fullspeed",
+}
+# platform_profile 名称 → user-facing 名称（用于显示当前模式）
+PP_TO_MODE = {v[0]: k for k, v in MODES.items()}
+
+
+# ---------------------------------------------------------------------------
+# 小工具
+# ---------------------------------------------------------------------------
+
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
+
+
+def read_text(path, default=None):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return fh.read().strip()
+    except (OSError, ValueError):
+        return default
+
+
+def find_profile_path():
+    """返回可用的 platform_profile 接口（类接口优先，传统接口兜底）。"""
+    for p in sorted(Path(SYSROOT, "class/platform_profile").glob("platform-profile-*/profile")):
+        if p.is_file():
+            return str(p)
+    if os.path.isfile(PP_LEGACY):
+        return PP_LEGACY
+    return None
+
+
+def find_choices_path():
+    profile = find_profile_path()
+    if profile is None:
+        return None
+    # /sys/class/platform_profile/platform-profile-N/choices
+    if "platform-profile" in profile:
+        return os.path.join(os.path.dirname(profile), "choices")
+    return os.path.join(SYSROOT, "firmware/acpi/platform_profile_choices")
+
+
+def find_driver_attr(name):
+    """查找 bitland-mifs-wmi 驱动在控制 WMI 设备上暴露的 sysfs 属性。"""
+    drv_dir = Path(SYSROOT, "bus/wmi/drivers") / DRIVER_NAME
+    if not drv_dir.is_dir():
+        return None
+    for dev in drv_dir.iterdir():
+        if not dev.is_dir():
+            continue
+        candidate = dev / name
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def find_hwmon():
+    """找到驱动注册的 hwmon 设备（name == bitland_mifs）。"""
+    for hwm in sorted(Path(SYSROOT, "class/hwmon").glob("hwmon*")):
+        if read_text(str(hwm / "name")) == "bitland_mifs":
+            return hwm
+    return None
+
+
+def driver_loaded():
+    if (Path(SYSROOT) / "module" / MODULE_NAME).is_dir():
+        return True
+    try:
+        with open("/proc/modules", encoding="utf-8") as fh:
+            return any(line.split(" ")[0] == MODULE_NAME for line in fh)
+    except OSError:
+        return False
+
+
+def driver_bound():
+    return (Path(SYSROOT, "bus/wmi/drivers") / DRIVER_NAME / WMI_CONTROL_GUID).is_dir()
+
+
+def ac_power_online():
+    for ps in sorted(Path(SYSROOT, "class/power_supply").glob("*")):
+        ptype = read_text(str(ps / "type"), "")
+        if ptype in ("Mains", "USB", "USB_CDP", "USB_PD", "Wireless"):
+            online = read_text(str(ps / "online"), "0")
+            if online not in (None, "0"):
+                return ps.name
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 传感器读取
+# ---------------------------------------------------------------------------
+
+def read_hwmon_sensors():
+    """返回 dict: cpu_temp(°C), fans: {label: rpm}。"""
+    hwm = find_hwmon()
+    out = {"cpu_temp": None, "fans": {}}
+    if hwm is None:
+        return out
+
+    temp = read_text(str(hwm / "temp1_input"))
+    if temp is not None and temp.isdigit():
+        out["cpu_temp"] = int(temp) // 1000
+
+    for fan in ("fan1_input", "fan2_input", "fan3_input"):
+        idx = fan[3]
+        raw = read_text(str(hwm / fan))
+        if raw is None or not raw.isdigit():
+            continue
+        label = read_text(str(hwm / f"fan{idx}_label"), f"fan{idx}")
+        out["fans"][label] = int(raw)
+    return out
+
+
+def read_k10temp():
+    """备用 CPU 温度源（k10temp，AMD 平台自带）。"""
+    for hwm in sorted(Path(SYSROOT, "class/hwmon").glob("hwmon*")):
+        if read_text(str(hwm / "name")) == "k10temp":
+            temp = read_text(str(hwm / "temp1_input"))
+            if temp and temp.isdigit():
+                return int(temp) // 1000
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 模式读写
+# ---------------------------------------------------------------------------
+
+def get_mode():
+    profile = find_profile_path()
+    if profile is None:
+        return None
+    current = read_text(profile)
+    if current is None:
+        return None
+    return PP_TO_MODE.get(current, current)
+
+
+def get_available_modes():
+    choices = read_text(find_choices_path() or "", "")
+    if not choices:
+        return []
+    return [c for c in choices.split() if c]
+
+
+def write_profile(profile_name, explain=True):
+    """把 platform_profile 名称写入 sysfs，自动处理权限。
+
+    返回 (成功?, 附加信息)。
+    """
+    path = find_profile_path()
+    if path is None:
+        return False, "未找到 platform_profile 接口 —— bitland-mifs-wmi 驱动未加载？"
+
+    text = profile_name + "\n"
+    # 1) 直接写（root 或文件本身可写）
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        return True, None
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            pass  # 权限不足 → 走 pkexec
+        elif exc.errno == errno.EOPNOTSUPP:
+            return False, EOPNOTSUPP_HINT
+        else:
+            return False, f"写入失败：{exc.strerror} (errno {exc.errno})"
+
+    # 2) pkexec + 特权助手（install.sh 安装）
+    if os.path.isfile(PRIV_HELPER):
+        return _pkexec_write(profile_name, explain)
+
+    # 3) 最后退回 power-profiles-daemon（仅覆盖 3 个标准模式）
+    return _ppd_write(profile_name, explain)
+
+
+EOPNOTSUPP_HINT = (
+    "固件拒绝了这次切换：性能/狂暴模式需要「圆孔电源适配器」供电，\n"
+    "         使用 Type-C(PD) 供电或电池时 BIOS 不允许进入高性能档。\n"
+    "         换用圆孔适配器后重试，或先切到 均衡/静音 模式。"
+)
+
+
+def _pkexec_write(profile_name, explain=True):
+    cmd = ["pkexec", PRIV_HELPER, profile_name]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=False, timeout=120)
+    except FileNotFoundError:
+        return False, "未安装 pkexec（sudo apt install policykit-1）"
+    except subprocess.TimeoutExpired:
+        return False, "pkexec 超时（120 秒无响应）"
+
+    if proc.returncode == 0:
+        return True, None
+
+    err = (proc.stderr or b"").decode("utf-8", "replace").strip()
+    if proc.returncode in (errno.EOPNOTSUPP, 95):  # EOPNOTSUPP
+        return False, EOPNOTSUPP_HINT
+    if proc.returncode == 126:  # pkexec 被拒绝
+        return False, "polkit 拒绝授权（详见 linux/README.md 中关于 polkit 的说明）"
+    if err:
+        return False, err
+    return False, f"特权助手退出码 {proc.returncode}"
+
+
+def _ppd_write(profile_name, explain=True):
+    """借助 power-profiles-daemon 设置（只支持 3 个标准档位）。"""
+    ppd_map = {
+        "low-power": "power-saver",
+        "balanced": "balanced",
+        "performance": "performance",
+    }
+    if profile_name not in ppd_map:
+        return False, (
+            "没有可用的特权写入途径（pkexec 助手未安装），\n"
+            "         且 power-profiles-daemon 不认识 balanced-performance 档。\n"
+            "         请运行 linux/scripts/install.sh 安装完整组件。"
+        )
+    if shutil.which("powerprofilesctl") is None:
+        return False, "未找到 powerprofilesctl，也未安装特权助手"
+    try:
+        proc = subprocess.run(
+            ["powerprofilesctl", "set", ppd_map[profile_name]],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"powerprofilesctl 调用失败：{exc}"
+    if proc.returncode == 0:
+        return True, "(经 power-profiles-daemon 切换)"
+    detail = (proc.stderr or "").strip()
+    return False, detail or "power-profiles-daemon 拒绝了切换"
+
+
+# ---------------------------------------------------------------------------
+# 子命令
+# ---------------------------------------------------------------------------
+
+def cmd_status(args):
+    mode = get_mode()
+    ok = driver_loaded() and driver_bound()
+
+    print("== Lecoo Bellator N176 (gcc-lite / Linux) ==")
+    print(f"  内核驱动   : {'已加载' if driver_loaded() else '未加载'}"
+          f"{' / 已绑定控制接口' if driver_bound() else ' / 未绑定控制接口'}")
+    if mode is None:
+        print("  当前模式   : 未知（驱动未就绪，运行 gcclite doctor 诊断）")
+    else:
+        label = MODES.get(mode, (None, mode))[1] if mode in MODES else mode
+        print(f"  当前模式   : {label}  ({mode})")
+
+    avail = get_available_modes()
+    if avail:
+        pretty = [MODES.get(PP_TO_MODE.get(a), (None, a))[1] if PP_TO_MODE.get(a) in MODES else a for a in avail]
+        print(f"  可用模式   : {'、'.join(pretty)}")
+
+    sensors = read_hwmon_sensors()
+    temp = sensors["cpu_temp"] if sensors["cpu_temp"] is not None else read_k10temp()
+    if temp is not None:
+        print(f"  CPU 温度   : {temp} °C")
+    for label, rpm in sensors["fans"].items():
+        print(f"  风扇 {label:<5}: {rpm} RPM")
+
+    ac = ac_power_online()
+    print(f"  外接电源   : {'已接入 (' + ac + ')' if ac else '未接入（电池）'}")
+    return 0
+
+
+def cmd_mode(args):
+    if not args.value:
+        mode = get_mode()
+        if mode is None:
+            eprint("无法读取当前模式：驱动未就绪（试试 gcclite doctor）")
+            return 1
+        if mode in MODES:
+            print(f"{mode}\t{MODES[mode][1]}")
+        else:
+            print(mode)
+        return 0
+
+    want = args.value.lower()
+    want = MODE_ALIASES.get(want, want)
+    if want not in MODES:
+        eprint(f"未知模式：{args.value}")
+        eprint("可选：quiet(静音) balanced(均衡) performance(性能) fullspeed(狂暴)")
+        return 2
+
+    profile_name, label = MODES[want]
+    avail = get_available_modes()
+    if avail and profile_name not in avail:
+        eprint(f"当前固件不支持 {label}（可用：{' '.join(avail)}）")
+        return 1
+
+    ok, info = write_profile(profile_name)
+    if not ok:
+        eprint(f"切换到 {label} 失败：{info}")
+        return 1
+    if info and args.verbose:
+        eprint(info)
+    # 写后立刻回读，向用户确认固件接受了
+    time.sleep(0.15)
+    now = get_mode()
+    if now == want:
+        print(f"✓ 已切换：{label}")
+        return 0
+    if now is not None and now != want:
+        eprint(f"⚠ 固件实际生效的模式是「{MODES.get(now, (None, now))[1] if now in MODES else now}」"
+               f"（请求的是 {label}）")
+        return 1
+    print(f"✓ 已请求切换：{label}")
+    return 0
+
+
+def cmd_list(args):
+    avail = get_available_modes()
+    if not avail:
+        eprint("无法读取模式列表（驱动未就绪）")
+        return 1
+    for a in avail:
+        mode = PP_TO_MODE.get(a)
+        if mode:
+            print(f"{mode:<12} {MODES[mode][1]:<14} (platform_profile: {a})")
+        else:
+            print(f"{'':<12} {'':<14} (platform_profile: {a})")
+    return 0
+
+
+def cmd_fan(args):
+    sensors = read_hwmon_sensors()
+    if not sensors["fans"]:
+        if sensors["cpu_temp"] is None:
+            eprint("未找到 bitland_mifs hwmon 设备（驱动未就绪）")
+            return 1
+    for label, rpm in sensors["fans"].items():
+        print(f"{label}: {rpm} RPM")
+    return 0
+
+
+def cmd_temp(args):
+    sensors = read_hwmon_sensors()
+    temp = sensors["cpu_temp"]
+    src = "bitland_mifs"
+    if temp is None:
+        temp = read_k10temp()
+        src = "k10temp"
+    if temp is None:
+        eprint("读取不到 CPU 温度")
+        return 1
+    print(f"{temp} °C  (源: {src})")
+    return 0
+
+
+def cmd_fan_boost(args):
+    path = find_driver_attr("fan_boost")
+    if path is None:
+        eprint("未找到 fan_boost 接口（驱动未就绪）")
+        return 1
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("1\n" if args.on else "0\n")
+    except OSError as exc:
+        eprint(f"写入 fan_boost 失败：{exc.strerror}（可能需要 root）")
+        return 1
+    print("✓ 风扇全速已开启（Fn+T 之外的软件途径）" if args.on else "✓ 风扇全速已关闭，回到自动调速")
+    return 0
+
+
+def cmd_monitor(args):
+    interval = max(1, min(60, args.interval))
+    try:
+        while True:
+            sensors = read_hwmon_sensors()
+            mode = get_mode()
+            temp = sensors["cpu_temp"]
+            if temp is None:
+                temp = read_k10temp()
+            fans = "  ".join(f"{k} {v:>5} RPM" for k, v in sensors["fans"].items()) or "-"
+            label = MODES.get(mode, (None, mode or "?"))[1] if mode in MODES else (mode or "?")
+            line = (f"\r\033[K模式: {label:<12} CPU: "
+                    f"{('%d °C' % temp) if temp is not None else '--'}   {fans}")
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            time.sleep(interval)
+    except KeyboardInterrupt:
+        print()
+        return 0
+
+
+def cmd_doctor(args):
+    print("gcclite doctor —— 诊断")
+    checks = []
+
+    def check(name, ok, hint=""):
+        checks.append(ok)
+        mark = "✓" if ok else "✗"
+        print(f"  [{mark}] {name}" + (f"\n        {hint}" if (hint and not ok) else ""))
+
+    kv = os.uname()
+    check(f"内核 {kv.release}", True)
+
+    wdev = Path(SYSROOT, "bus/wmi/devices") / WMI_CONTROL_GUID
+    check("WMI 控制接口存在 (B60BFB48…)", wdev.is_dir(),
+          "未发现 MICommonInterface 设备 —— 本机固件可能不带此接口")
+
+    check("bitland-mifs-wmi 模块已加载", driver_loaded(),
+          "运行 sudo modprobe bitland_mifs_wmi；若报 Key was rejected，"
+          "说明 MOK 未注册，需完成 Secure Boot 注册（见 README）")
+
+    check("控制 WMI 设备已绑定驱动", driver_bound(),
+          "模块加载了但没有绑定：dmesg | grep bitland 查看原因")
+
+    pp = find_profile_path()
+    check("platform_profile sysfs 就绪", pp is not None,
+          "驱动未注册 platform_profile —— 请提供 dmesg 输出反馈")
+
+    hwm = find_hwmon()
+    check("hwmon 传感器就绪 (风扇/温度)", hwm is not None)
+
+    helper = Path(PRIV_HELPER)
+    check("特权助手已安装 (pkexec 写入)", helper.is_file(),
+          "运行 linux/scripts/install.sh 以安装免 sudo 切换")
+
+    sb = shutil.which("mokutil")
+    if sb:
+        try:
+            r = subprocess.run(["mokutil", "--sb-state"], capture_output=True, text=True, timeout=10)
+            sbstate = (r.stdout or "").strip()
+        except (OSError, subprocess.TimeoutExpired):
+            sbstate = ""
+        secure = "enabled" in sbstate.lower()
+        check(f"Secure Boot 状态: {sbstate or '未知'}", True)
+        if secure:
+            # 判断依据用 --list-enrolled（直读固件变量），而不用 --test-key：
+            #   * --test-key 在“未注册”时退出码仍是 0，只能靠匹配输出文本；
+            #   * 它读的是运行时缓存 MokListRT，刚注册完可能仍是旧值，
+            #     会把「已注册」误判成「未注册」。
+            # 另：读 EFI 变量需 root，普通用户下拿不到输出 -> 报“未知”。
+            enrolled = False
+            pending = False
+            unknown = False
+            try:
+                r = subprocess.run(["mokutil", "--list-enrolled"],
+                                   capture_output=True, text=True, timeout=10)
+                out = (r.stdout or "") + (r.stderr or "")
+                if "gcc-lite" in out:
+                    enrolled = True
+                elif "denied" in out.lower():
+                    unknown = True
+
+                if not enrolled:
+                    r2 = subprocess.run(["mokutil", "--list-new"],
+                                        capture_output=True, text=True, timeout=10)
+                    out2 = (r2.stdout or "") + (r2.stderr or "")
+                    if "gcc-lite" in out2:
+                        pending = True
+                    elif "denied" in out2.lower():
+                        unknown = True
+            except (OSError, subprocess.TimeoutExpired):
+                unknown = True
+
+            if enrolled:
+                check("MOK 签名密钥已注册", True)
+            elif pending:
+                check("MOK 注册请求已提交（等重启在 MOK 菜单确认）", False,
+                      "重启 → 蓝色 MOK 菜单 → Enroll MOK → 输密码 → Reboot，"
+                      "然后重跑 install.sh")
+            elif unknown:
+                print("  [-] MOK 状态未知（读取 EFI 变量需 root）")
+                print("        用 sudo gcclite doctor 复查，或 "
+                      "sudo mokutil --list-enrolled 查看")
+            else:
+                check("MOK 签名密钥已注册", False,
+                      f"执行 sudo bash linux/scripts/install.sh，"
+                      f"它会 mokutil --import {MOK_DER}，随后重启并在 MOK 菜单 Enroll")
+    else:
+        print("  [-] mokutil 不可用，跳过 Secure Boot 检查")
+
+    if shutil.which("powerprofilesctl"):
+        try:
+            r = subprocess.run(["powerprofilesctl", "get"], capture_output=True, text=True, timeout=10)
+            if r.returncode == 0:
+                print(f"  [i] power-profiles-daemon 当前档位: {r.stdout.strip()}")
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+
+    print()
+    if all(checks):
+        print("一切正常 🎉")
+        return 0
+    print(f"{checks.count(False)} 项需要处理（见上方提示）")
+    return 1
+
+
+def cmd_gpu_mode(args):
+    path = find_driver_attr("gpu_mode")
+    if path is None:
+        eprint("未找到 gpu_mode 接口（驱动未就绪）")
+        return 1
+    if not args.value:
+        print(read_text(path, "?"))
+        return 0
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(args.value.lower() + "\n")
+    except OSError as exc:
+        eprint(f"写入 gpu_mode 失败：{exc.strerror}（可能需要 root；改显存档位通常还需重启生效）")
+        return 1
+    print(f"✓ GPU 模式已请求切换为 {args.value}（一般需要重启才能在 BIOS 层生效）")
+    return 0
+
+
+def cmd_kb_mode(args):
+    path = find_driver_attr("kb_mode")
+    if path is None:
+        eprint("未找到 kb_mode 接口（驱动未就绪）")
+        return 1
+    if not args.value:
+        print(read_text(path, "?"))
+        return 0
+    valid = ("off", "cyclic", "fixed", "custom")
+    val = args.value.lower()
+    if val not in valid:
+        eprint(f"无效 RGB 键盘模式：{args.value}（可选 {' '.join(valid)}）")
+        return 2
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(val + "\n")
+    except OSError as exc:
+        eprint(f"写入 kb_mode 失败：{exc.strerror}（可能需要 root）")
+        return 1
+    print(f"✓ 键盘灯效已设为 {val}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# 参数解析
+# ---------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="gcclite",
+        description="Lecoo 斗战者 N176 性能模式控制（gcc-lite 的 Linux 版）",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+示例:
+  gcclite                     # 查看当前状态
+  gcclite mode fullspeed      # 狂暴模式（中文别名：gcclite mode 狂暴）
+  gcclite mode quiet          # 静音模式
+  gcclite monitor 2           # 每 2 秒刷新一次传感器
+  gcclite doctor              # 诊断安装是否完整
+""")
+    sub = p.add_subparsers(dest="command", metavar="命令")
+
+    sub.add_parser("status", help="显示模式/温度/风扇/电源状态").set_defaults(func=cmd_status)
+
+    m = sub.add_parser("mode", help="查看或设置性能模式")
+    m.add_argument("value", nargs="?", help="quiet|balanced|performance|fullspeed 或中文别名")
+    m.add_argument("-v", "--verbose", action="store_true", help="显示切换路径细节")
+    m.set_defaults(func=cmd_mode)
+
+    sub.add_parser("list", help="列出固件支持的模式").set_defaults(func=cmd_list)
+    sub.add_parser("fan", help="读取风扇转速").set_defaults(func=cmd_fan)
+    sub.add_parser("temp", help="读取 CPU 温度").set_defaults(func=cmd_temp)
+
+    fb = sub.add_parser("fan-boost", help="风扇全速开关（对应原版 MaxFanSpeed）")
+    fb.add_argument("state", choices=["on", "off"], help="on=全速 / off=自动")
+    fb.set_defaults(func=lambda a: cmd_fan_boost(type("A", (), {"on": a.state == "on"})()))
+
+    mo = sub.add_parser("monitor", help="循环刷新状态")
+    mo.add_argument("interval", nargs="?", type=int, default=2, help="刷新间隔秒数（默认 2）")
+    mo.set_defaults(func=cmd_monitor)
+
+    sub.add_parser("doctor", help="安装自检").set_defaults(func=cmd_doctor)
+
+    g = sub.add_parser("gpu-mode", help="查看/设置 GPU 模式 (hybrid|discrete|uma)")
+    g.add_argument("value", nargs="?")
+    g.set_defaults(func=cmd_gpu_mode)
+
+    k = sub.add_parser("kb-mode", help="查看/设置键盘 RGB 灯效 (off|cyclic|fixed|custom)")
+    k.add_argument("value", nargs="?")
+    k.set_defaults(func=cmd_kb_mode)
+
+    return p
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    parser = build_parser()
+    args = parser.parse_args(argv)
+
+    if args.command is None:
+        return cmd_status(args)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    # Windows 版 gcc-lite 的调度功能（按时间段自动切模式）在 Linux 下
+    # 建议用 systemd timer / cron 实现，见 linux/README.md。
+    sys.exit(main())

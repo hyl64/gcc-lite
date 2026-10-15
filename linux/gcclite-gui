@@ -1,0 +1,235 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+gcclite-gui —— Lecoo 斗战者 N176 性能模式图形界面（GTK4）
+==========================================================
+
+对应 Windows 版 gcc_lite.exe 的图形界面。逻辑与命令行版 gcclite
+共用同一份代码（本文件把 gcclite 当作模块加载），
+因此 CLI 与 GUI 的行为、模式映射、错误提示完全一致。
+
+依赖：python3-gi（GTK4），Ubuntu 桌面版自带。
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import sys
+
+import gi
+
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gdk, GLib, Gtk  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# 加载同目录的 gcclite 作为共享模块
+# ---------------------------------------------------------------------------
+
+
+def load_gcclite():
+    here = os.path.dirname(os.path.abspath(__file__))
+    for candidate in (os.path.join(here, "gcclite"),
+                      os.path.join(os.path.dirname(here), "gcclite")):
+        if os.path.isfile(candidate):
+            loader = importlib.machinery.SourceFileLoader("gcclite_mod", candidate)
+            spec = importlib.util.spec_from_loader("gcclite_mod", loader)
+            mod = importlib.util.module_from_spec(spec)
+            loader.exec_module(mod)
+            return mod
+    raise SystemExit("找不到 gcclite，请先运行 linux/scripts/install.sh")
+
+
+gcclite = load_gcclite()
+
+MODE_ORDER = ["quiet", "balanced", "performance", "fullspeed"]
+MODE_LABELS = {
+    "quiet": "静音\nQuiet",
+    "balanced": "均衡\nBalanced",
+    "performance": "性能\nPerformance",
+    "fullspeed": "狂暴\nFull-speed",
+}
+MODE_SUBTITLE = {k: v[1] for k, v in gcclite.MODES.items()}
+
+
+class GccLiteWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+        self.set_title("GCC Lite · 斗战者 N176")
+        self.set_default_size(560, 420)
+        self._updating = False
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        outer.set_margin_top(16)
+        outer.set_margin_bottom(16)
+        outer.set_margin_start(16)
+        outer.set_margin_end(16)
+        self.set_child(outer)
+
+        # --- 模式按钮 -------------------------------------------------------
+        mode_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8,
+                           homogeneous=True)
+        outer.append(Gtk.Label(label="性能模式"))
+        outer.append(mode_box)
+
+        self.mode_buttons = {}
+        for mode in MODE_ORDER:
+            btn = Gtk.ToggleButton(label=MODE_LABELS[mode])
+            btn.set_size_request(-1, 72)
+            btn.connect("toggled", self.on_mode_toggled, mode)
+            btn.add_css_class("pill")
+            mode_box.append(btn)
+            self.mode_buttons[mode] = btn
+
+        # --- 风扇全速开关 ---------------------------------------------------
+        boost_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        boost_row.set_margin_top(4)
+        self.boost_btn = Gtk.ToggleButton(label="风扇全速")
+        self.boost_btn.connect("toggled", self.on_boost_toggled)
+        boost_row.append(self.boost_btn)
+        boost_lbl = Gtk.Label(
+            label="<small>对应原版 MaxFanSpeed；关闭后回到 EC 自动调速</small>",
+            use_markup=True)
+        boost_lbl.set_halign(Gtk.Align.END)
+        boost_lbl.set_hexpand(True)
+        boost_row.append(boost_lbl)
+        outer.append(boost_row)
+
+        # --- 传感器 ---------------------------------------------------------
+        frame = Gtk.Frame(label="传感器")
+        grid = Gtk.Grid(column_spacing=16, row_spacing=8)
+        grid.set_margin_top(10)
+        grid.set_margin_bottom(10)
+        grid.set_margin_start(12)
+        grid.set_margin_end(12)
+        frame.set_child(grid)
+        outer.append(frame)
+
+        self.sensors = {}
+        for row, (key, title) in enumerate(
+                (("cpu_temp", "CPU 温度"), ("fan_cpu", "CPU 风扇"),
+                 ("fan_gpu", "GPU 风扇"), ("fan_sys", "SYS 风扇"),
+                 ("ac", "供电"), ("driver", "驱动"))):
+            lbl = Gtk.Label(label=title, halign=Gtk.Align.START)
+            val = Gtk.Label(label="—", halign=Gtk.Align.END, hexpand=True)
+            grid.attach(lbl, 0, row, 1, 1)
+            grid.attach(val, 1, row, 1, 1)
+            self.sensors[key] = val
+
+        # --- 状态条 ---------------------------------------------------------
+        self.status = Gtk.Label(label="")
+        self.status.set_wrap(True)
+        self.status.set_xalign(0)
+        outer.append(self.status)
+
+        self.refresh()
+        GLib.timeout_add_seconds(2, self.refresh)
+        self.present()
+
+    # -------------------------------------------------------------------
+    # 事件
+    # -------------------------------------------------------------------
+
+    def on_mode_toggled(self, btn, mode):
+        if self._updating or not btn.get_active():
+            return
+        self._updating = True
+        try:
+            for other_mode, other_btn in self.mode_buttons.items():
+                if other_mode != mode and other_btn.get_active():
+                    other_btn.set_active(False)
+            ok, detail = gcclite.write_profile(gcclite.MODES[mode][0])
+            if ok:
+                self.set_status(f"✓ 已切换到 {MODE_SUBTITLE[mode]}", "ok")
+            else:
+                self.set_status(f"切换失败：{detail}", "err")
+        finally:
+            self._updating = False
+        self.refresh()
+
+    def on_boost_toggled(self, btn):
+        if self._updating:
+            return
+        path = gcclite.find_driver_attr("fan_boost")
+        if path is None:
+            self.set_status("未找到 fan_boost 接口（驱动未就绪）", "err")
+            self._updating = True
+            btn.set_active(False)
+            self._updating = False
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("1\n" if btn.get_active() else "0\n")
+            state = "已开启" if btn.get_active() else "已关闭"
+            self.set_status(f"✓ 风扇全速 {state}", "ok")
+        except OSError as exc:
+            self.set_status(f"风扇全速写入失败：{exc.strerror}", "err")
+            self._updating = True
+            btn.set_active(not btn.get_active())
+            self._updating = False
+
+    # -------------------------------------------------------------------
+    # 刷新
+    # -------------------------------------------------------------------
+
+    def set_status(self, text, kind):
+        self.status.set_text(text)
+        css = {"ok": "success", "err": "error"}.get(kind)
+        for name in ("success", "error"):
+            self.status.remove_css_class(name)
+        if css:
+            self.status.add_css_class(css)
+
+    def refresh(self):
+        sensors = gcclite.read_hwmon_sensors()
+        mode = gcclite.get_mode()
+        loaded = gcclite.driver_loaded()
+
+        self._updating = True
+        for m, btn in self.mode_buttons.items():
+            btn.set_active(m == mode)
+            btn.set_sensitive(loaded)
+        self._updating = False
+
+        self.boost_btn.set_sensitive(loaded)
+
+        temp = sensors["cpu_temp"]
+        if temp is None:
+            temp = gcclite.read_k10temp()
+        self.sensors["cpu_temp"].set_text(f"{temp} °C" if temp is not None else "—")
+        self.sensors["fan_cpu"].set_text(f"{sensors['fans'].get('CPU', '—')} RPM")
+        self.sensors["fan_gpu"].set_text(f"{sensors['fans'].get('GPU', '—')} RPM")
+        self.sensors["fan_sys"].set_text(f"{sensors['fans'].get('SYS', '—')} RPM")
+        ac = gcclite.ac_power_online()
+        self.sensors["ac"].set_text(ac if ac else "电池")
+        self.sensors["driver"].set_text(
+            "已加载" if loaded else "未加载（运行 gcclite doctor）")
+
+        if not loaded and not self.status.get_text():
+            self.set_status("驱动未加载 —— 请先完成安装（linux/scripts/install.sh）", "err")
+        return GLib.SOURCE_CONTINUE
+
+
+class GccLiteApp(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id="com.hyl64.gcclite")
+
+    def do_activate(self):
+        GccLiteWindow(self)
+
+
+def main():
+    # 给暗色主题下的成功/失败文字上点颜色
+    provider = Gtk.CssProvider()
+    provider.load_from_data(
+        "label.success { color: @success_color; }"
+        "label.error   { color: @error_color; }".encode("utf-8"))
+    if Gdk.Display.get_default() is not None:
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    GccLiteApp().run()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+gcclite-write —— gcclite 的特权写入助手
+========================================
+
+安装位置: /usr/local/libexec/gcclite-write   (root:root 0755)
+调用途径: pkexec gcclite-write <profile>     (polkit 规则见 45-gcclite.rules)
+
+只做一件事：把**白名单内**的 platform_profile 值写入 sysfs。
+白名单之外的任何输入一律拒绝，因此即使被普通用户调用，
+它也无法做「改性能档位」以外的任何事情。
+"""
+
+import errno
+import glob
+import os
+import sys
+
+ALLOWED = ("low-power", "balanced", "balanced-performance", "performance")
+
+EXIT_USAGE = 64        # EX_USAGE
+EXIT_UNAVAILABLE = 69  # EX_UNAVAILABLE
+
+
+def find_profile_path():
+    for path in sorted(glob.glob("/sys/class/platform_profile/platform-profile-*/profile")):
+        if os.path.isfile(path):
+            return path
+    if os.path.isfile("/sys/firmware/acpi/platform_profile"):
+        return "/sys/firmware/acpi/platform_profile"
+    return None
+
+
+def main():
+    if os.geteuid() != 0:
+        print("gcclite-write: 需要以 root 运行（应经 pkexec 调用）", file=sys.stderr)
+        return errno.EPERM
+
+    if len(sys.argv) != 2 or sys.argv[1] not in ALLOWED:
+        print("usage: gcclite-write {low-power|balanced|balanced-performance|performance}",
+              file=sys.stderr)
+        return EXIT_USAGE
+
+    path = find_profile_path()
+    if path is None:
+        print("gcclite-write: 未找到 platform_profile 接口（bitland-mifs-wmi 未加载？）",
+              file=sys.stderr)
+        return EXIT_UNAVAILABLE
+
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(sys.argv[1] + "\n")
+    except OSError as exc:
+        # 保留 errno 作为退出码，调用方据此区分
+        # EOPNOTSUPP(95) = 固件因供电类型拒绝高性能档
+        print(f"gcclite-write: 写入失败: {exc.strerror} (errno {exc.errno})", file=sys.stderr)
+        return exc.errno if exc.errno and 0 < exc.errno < 256 else 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

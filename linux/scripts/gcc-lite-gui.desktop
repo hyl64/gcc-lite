@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=GCC Lite 性能模式
+Name[en]=GCC Lite Performance
+GenericName=Lecoo Bellator N176 Performance Modes
+Comment=切换静音/均衡/性能/狂暴模式
+Comment[en]=Switch quiet/balanced/performance/full-speed modes
+Exec=gcclite-gui
+Icon=preferences-system-power
+Terminal=false
+Categories=System;Settings;HardwareSettings;
+Keywords=power;fan;performance;quiet;turbo;gcc-lite;
+StartupNotify=true

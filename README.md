@@ -6,6 +6,10 @@ A **229 KB** pure Win32 C++ replacement for the 433 MB .NET/WPF vendor console
 Reverse-engineered hardware protocol, zero third-party dependencies, single native executable.
 
 [中文说明](#中文说明) · [Protocol](docs/PROTOCOL.md) · [Findings](docs/FINDINGS.md)
+· **[Linux / Ubuntu 移植版](linux/README.md)（`gcclite` + 内核驱动）**
+
+> **Ubuntu 用户**：同一硬件协议在 Linux 上的完整移植（含官方 `bitland-mifs-wmi`
+> 内核驱动的 7.0 回移植、CLI/GUI、一键安装）见 [linux/](linux/)。
 
 ---
 
@@ -195,6 +199,10 @@ endorsed by Lecoo, Lenovo, or Bitland. Use at your own risk.
 
 <a id="中文说明"></a>
 ## 中文说明
+
+> 🐧 **Ubuntu / Linux 用户请看 [linux/README.md](linux/README.md)** ——
+> 本仓库的 Linux 移植版（内核驱动 `bitland-mifs-wmi` + `gcclite` CLI/GUI，
+> 支持静音/均衡/性能/狂暴四档切换，一键安装）。
 
 用纯 Win32 C++ 重写联想 Lecoo 斗战者 N176 随机附带的管理程序（原版
 433 MB / 972 文件 → 229 KB / 1 文件，缩小约 1900 倍），并新增手动风扇调速、

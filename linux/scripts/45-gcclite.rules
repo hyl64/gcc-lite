@@ -1,0 +1,22 @@
+/*
+ * gcclite —— 允许本机活动会话免密切换性能模式
+ *
+ * pkexec (polkit >= 124) 使用通用动作 org.freedesktop.policykit.exec，
+ * 实际要执行的程序路径放在 detail "org.freedesktop.policykit.exec.path" 里，
+ * 规则中用 action.lookup() 取出比对。
+ *
+ * 这里授予的权限等价于 power-profiles-daemon 自带的
+ * org.freedesktop.UPower.PowerProfiles.switch-profile（allow_active=yes），
+ * 且助手只接受 4 个白名单档位，无法做其它任何事。
+ *
+ * 想收紧成仅限某个用户组时，把 subject.active 换成
+ * subject.isInGroup("gcclite") 并把用户加入该组即可。
+ */
+polkit.addRule(function (action, subject) {
+    if (action.id == "org.freedesktop.policykit.exec" &&
+        action.lookup("org.freedesktop.policykit.exec.path") == "/usr/local/libexec/gcclite-write" &&
+        subject.active) {
+        return polkit.Result.YES;
+    }
+    return polkit.Result.NOT_HANDLED;
+});
